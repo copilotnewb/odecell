@@ -37,6 +37,7 @@ class ModelSolver():
         self.compiledCodeCall = 0
         self.compiledCodeJac = 0
         self.compiledCodeFlux = 0
+        self.cythonSource = None
         
     def __call__(self,t,y):
         return self.myCall(t,y)
@@ -76,7 +77,13 @@ class ModelSolver():
     def buildCall(self, verbose=0, useJac=False,
                   transpJac=False, nocheck=False, 
                   odeint=True, cythonBuild=False, 
-                  functor=False, noBuild=False):
+                  functor=False, noBuild=False,
+                  sourceOnly=False, typedParameters=False):
+
+        if sourceOnly and not cythonBuild:
+            raise ValueError("sourceOnly requires cythonBuild=True")
+        if typedParameters and not (cythonBuild and functor):
+            raise ValueError("typedParameters requires a Cython functor")
         
         #print("\nBuilding call...")
         
@@ -124,10 +131,11 @@ class ModelSolver():
             header += "cimport numpy as np\n\n"
             header += "ctypedef np.double_t DTYPEDBL_t\n\n"
             
-            header += "if cython.compiled:\n"
-            header += "    print(\"Yep, I'm compiled.\")\n"
-            header += "else:\n"
-            header += "    print(\"Just a lowly interpreted script.\")\n"
+            if not sourceOnly:
+                header += "if cython.compiled:\n"
+                header += "    print(\"Yep, I'm compiled.\")\n"
+                header += "else:\n"
+                header += "    print(\"Just a lowly interpreted script.\")\n"
             
             # Only used in case we build the solver as a functor.
             classDef = ""
@@ -225,6 +233,16 @@ class ModelSolver():
             calcFluxDef = "def calcFlux(self, t,y=[]):\n\n"
         
         
+        if typedParameters:
+            # The cached backend substitutes numeric bindings with reads from
+            # this typed array. Keep double precision time as used by SciPy.
+            callDef = callDef.replace("float t", "double t")
+            callJacDef = callJacDef.replace("float t", "double t")
+            calcFluxDef = calcFluxDef.replace("float t", "double t")
+            parameterView = ident + "cdef np.ndarray[DTYPEDBL_t, ndim=1] _odecell_params = self.params\n\n"
+            calcFluxDef += parameterView
+            callJacDef += parameterView
+
         paramLines = ""
         
         # Writes all explicit parameters in the final function.
@@ -257,7 +275,7 @@ class ModelSolver():
             
         metInitLines += "\n\n"
         
-        if not cythonBuild:
+        if not cythonBuild or (typedParameters and self.model.getGR() != 0):
             callDef += metInitLines
         calcFluxDef += metInitLines
         callJacDef += metInitLines
@@ -272,26 +290,27 @@ class ModelSolver():
         ##########################
         ## Writes all final rate forms for model reactions
         
-        definedGrads = set()
-        
-        metIDList = [met.getID() for met in self.model.getMetList()]
-        metIDList = np.asarray(metIDList)
-        numMets = len(metIDList)
-        
-        depMetIDSet = reduce(set.union,[met.getDependMets() for met in self.model.getMetList()])
-        
-        depMetMapping = dict()
-        for met in self.model.getMetList():
-            for depMetID in met.getDependMets():
-                if depMetID in depMetMapping.keys():
-                    print("ERROR! Dependent Metabolite cannot be dependent on more than one free metabolite.")
-                    sys.error(2)
-                depMetMapping[depMetID] = met.getID()
-        
-        if verbose > 1:
-            print("Dependent metabolites:",depMetIDSet)
-            print("Dependencies:",depMetMapping)
-        
+        if useJac:
+            definedGrads = set()
+
+            metIDList = [met.getID() for met in self.model.getMetList()]
+            metIDList = np.asarray(metIDList)
+            numMets = len(metIDList)
+
+            depMetIDSet = reduce(set.union,[met.getDependMets() for met in self.model.getMetList()])
+
+            depMetMapping = dict()
+            for met in self.model.getMetList():
+                for depMetID in met.getDependMets():
+                    if depMetID in depMetMapping.keys():
+                        print("ERROR! Dependent Metabolite cannot be dependent on more than one free metabolite.")
+                        sys.error(2)
+                    depMetMapping[depMetID] = met.getID()
+
+            if verbose > 1:
+                print("Dependent metabolites:",depMetIDSet)
+                print("Dependencies:",depMetMapping)
+
         rxnLines = ""
         rxnLinesJac = "" # So we keep only auxiliary rxns.
         
@@ -316,53 +335,54 @@ class ModelSolver():
             rxnRetunValID.append(rxnID)
             
             if rxn.getNumber() == 0:
-                
-                if (verbose > 1):
-                    print("\n#######################################\n")
-                    print(rxnID,"-->",rxn.getResult())
-                    print(rxn.getFinalRate(prefix))
-                
-                rxnLinesJac += ident + "# (" + rxnID + ") " + rxnName + "\n"
-                rxnLinesJac += ident + cythVarPref + rxn.getFinalRate(prefix) + "\n\n"
-                
-                if (verbose > 1):
-                    print("ReactionKeys:",rxn.getKeysVals())
-                    print("Dependent Rxn Keys:",rxn.getDependentKeysVals())
-                
-                # For each reaction, get its gradient components and the respective
-                # metabolite ID (that is, the metDI for the variable with respect to
-                # which the rate form was differentiated).
-                for gradDat in rxn.getGrad():
-                    
+
+                if useJac:
                     if (verbose > 1):
-                        print(gradDat,np.where(metIDList == gradDat[0]))
-                    
-                    # In case there is a gradient component defined but its key is
-                    # bound to a fixed parameter, rather than to a metabolite, we skip it.
-                    # One example is the transport and modification of a molecule 
-                    # from the extracellular environment (e.g, PTS complex), 
-                    # the extracellular could be considered constant, but not the
-                    # intracellular concentration of the molecule.
-                    if len(np.where(metIDList == gradDat[0])[0]) < 1 and not (gradDat[0] in depMetIDSet):
-                        continue
-                    
-                    # For dependent reactions, we will write its gradient with respect to a free metabolite
-                    # and not with respect to the dependent metabolite it may be defined with.
-                    # The rate froms must reflect this definition and have, in its gradient components,
-                    # direct dependencies on the dependent metabolite derivatives.
-                    if gradDat[0] in depMetIDSet:
-                        targMet =  depMetMapping[gradDat[0]] 
-                    else:
-                        targMet = gradDat[0]
-                    
-                    partName = "d" + rxn.getResult() + "_d" + targMet
-                    
-                    if not partName in definedGrads:
-                        rxnLinesJac += ident + "# d/d" + targMet+ "(" + rxn.getID() + ") [" + gradDat[0] + "] " + rxn.getName() + "\n"
-                        rxnLinesJac += ident + cythVarPref + partName + " = " + gradDat[1]
-                        rxnLinesJac += "\n\n"
-                        definedGrads.add(partName)
-                        
+                        print("\n#######################################\n")
+                        print(rxnID,"-->",rxn.getResult())
+                        print(rxn.getFinalRate(prefix))
+
+                    rxnLinesJac += ident + "# (" + rxnID + ") " + rxnName + "\n"
+                    rxnLinesJac += ident + cythVarPref + rxn.getFinalRate(prefix) + "\n\n"
+
+                    if (verbose > 1):
+                        print("ReactionKeys:",rxn.getKeysVals())
+                        print("Dependent Rxn Keys:",rxn.getDependentKeysVals())
+
+                    # For each reaction, get its gradient components and the respective
+                    # metabolite ID (that is, the metDI for the variable with respect to
+                    # which the rate form was differentiated).
+                    for gradDat in rxn.getGrad():
+
+                        if (verbose > 1):
+                            print(gradDat,np.where(metIDList == gradDat[0]))
+
+                        # In case there is a gradient component defined but its key is
+                        # bound to a fixed parameter, rather than to a metabolite, we skip it.
+                        # One example is the transport and modification of a molecule
+                        # from the extracellular environment (e.g, PTS complex),
+                        # the extracellular could be considered constant, but not the
+                        # intracellular concentration of the molecule.
+                        if len(np.where(metIDList == gradDat[0])[0]) < 1 and not (gradDat[0] in depMetIDSet):
+                            continue
+
+                        # For dependent reactions, we will write its gradient with respect to a free metabolite
+                        # and not with respect to the dependent metabolite it may be defined with.
+                        # The rate froms must reflect this definition and have, in its gradient components,
+                        # direct dependencies on the dependent metabolite derivatives.
+                        if gradDat[0] in depMetIDSet:
+                            targMet =  depMetMapping[gradDat[0]]
+                        else:
+                            targMet = gradDat[0]
+
+                        partName = "d" + rxn.getResult() + "_d" + targMet
+
+                        if not partName in definedGrads:
+                            rxnLinesJac += ident + "# d/d" + targMet+ "(" + rxn.getID() + ") [" + gradDat[0] + "] " + rxn.getName() + "\n"
+                            rxnLinesJac += ident + cythVarPref + partName + " = " + gradDat[1]
+                            rxnLinesJac += "\n\n"
+                            definedGrads.add(partName)
+
             elif cythonBuild:
                 callDef += ident + "# (" + rxnID + ") " + rxnName + "\n"
                 callDef += ident + cythVarPref + rxn.getResult() + " = fluxes[" + str(rxnCounter) + "]\n\n"
@@ -378,155 +398,158 @@ class ModelSolver():
         callJacDef += rxnLinesJac
         
         ##########################
-        ## Writes all final forms for model jacobians
-        
-        # Prepares and pre-populates a 2D list of all IvJ results.
-        jacResIJ = []
-        for i in range(numMets):
-            jacResIJ.append(["0"]*numMets)
-        
-        # Loops over all metabolites whose concentrations are tracked
-        # and, for each one, determine all jacobian elements.
-        for met in self.model.getMetList():
-            
-            metID = met.getID()
-            
-            if (verbose > 1):
-                print("\n#######################################\n")
-                print(metID)
-            
-            # The first "[0]" gets the first array of indices that "np.where" 
-            # returns (it is also the only array of indices since it is a 1D list).
-            # The second "[0]" gets the first (and only) index (since metabolite
-            # IDs cannot be repeated).
-            iIndx = np.where(metIDList == metID)[0][0]
-            
-            # Each metabolite may have non-zero jacobian elements with respect
-            # to different metabolites, depending on the reaction with which it
-            # is asociated.
-            for rxnIndex in met.getReactions():
-                
-                rxn = self.model.getReaction(rxnIndex)
-                
+        ## Writes all final forms for model jacobians.
+        ## The dense matrix and derivative expressions are unnecessary when
+        ## the integrator estimates its own Jacobian (useJac=False).
+
+        if useJac:
+            # Prepares and pre-populates a 2D list of all IvJ results.
+            jacResIJ = []
+            for i in range(numMets):
+                jacResIJ.append(["0"]*numMets)
+
+            # Loops over all metabolites whose concentrations are tracked
+            # and, for each one, determine all jacobian elements.
+            for met in self.model.getMetList():
+
+                metID = met.getID()
+
                 if (verbose > 1):
-                    print("\n",rxn)
-                
-                # Gets the stoichiometry for the current metabolite in this reacion
-                stoic = rxn.getStoichiometry(metID)
-                # Prepares the string for the final call function.
-                # If the stoichiometry is positive (for a product), or zero,
-                # adds a "plus" sign to build the final function.
-                if stoic >= 0 :
-                    stoiStr = "+" + str(stoic)
-                else :
-                    stoiStr = str(stoic)
-                
-                if (verbose > 1):
-                    print("\nGradient Components:")
-                
-                # For each reaction, get its gradient components and the respective
-                # metabolite ID (that is, the metDI for the variable with respect to
-                # which the rate form was differentiated).
-                for gradDat in rxn.getGrad():
-                    
-                    # In case there is a gradient component defined but its key is
-                    # bound to a fixed parameter, rather than to a metabolite, we skip it.
-                    # One example is the transport and modification of a molecule 
-                    # from the extracellular environment (e.g, PTS complex), 
-                    # the extracellular could be considered constant, but not the
-                    # intracellular concentration of the molecule.
-                    if len(np.where(metIDList == gradDat[0])[0]) < 1 and not (gradDat[0] in depMetIDSet):
-                        continue
-                    
+                    print("\n#######################################\n")
+                    print(metID)
+
+                # The first "[0]" gets the first array of indices that "np.where"
+                # returns (it is also the only array of indices since it is a 1D list).
+                # The second "[0]" gets the first (and only) index (since metabolite
+                # IDs cannot be repeated).
+                iIndx = np.where(metIDList == metID)[0][0]
+
+                # Each metabolite may have non-zero jacobian elements with respect
+                # to different metabolites, depending on the reaction with which it
+                # is asociated.
+                for rxnIndex in met.getReactions():
+
+                    rxn = self.model.getReaction(rxnIndex)
+
                     if (verbose > 1):
-                        #print(gradDat,np.where(metIDList == gradDat[0]))
-                        print(gradDat)
-                    
-                    # For dependent reactions, we will write its gradient with respect to a free metabolite
-                    # and not with respect to the dependent metabolite it may be defined with.
-                    # The rate froms must reflect this definition and have, in its gradient components,
-                    # direct dependencies on the dependent metabolite derivatives.
-                    if gradDat[0] in depMetIDSet:
-                        targMet =  depMetMapping[gradDat[0]] 
-                        freeTarget = False
-                    else:
-                        targMet = gradDat[0]
-                        freeTarget = True
-                    
-                    jIndx = np.where(metIDList == targMet)[0][0]
-                    
-                    partName = "dV" + str(rxn.getNumber()) + "_d" + targMet
-                    
-                    if not partName in definedGrads:
-                        callJacDef += ident + "# (" + rxn.getID() + ") [" + gradDat[0] + "] " + rxn.getName() + "\n"
-                        if freeTarget:
-                            callJacDef += ident + cythVarPref + partName + " = " + gradDat[1]
+                        print("\n",rxn)
+
+                    # Gets the stoichiometry for the current metabolite in this reacion
+                    stoic = rxn.getStoichiometry(metID)
+                    # Prepares the string for the final call function.
+                    # If the stoichiometry is positive (for a product), or zero,
+                    # adds a "plus" sign to build the final function.
+                    if stoic >= 0 :
+                        stoiStr = "+" + str(stoic)
+                    else :
+                        stoiStr = str(stoic)
+
+                    if (verbose > 1):
+                        print("\nGradient Components:")
+
+                    # For each reaction, get its gradient components and the respective
+                    # metabolite ID (that is, the metDI for the variable with respect to
+                    # which the rate form was differentiated).
+                    for gradDat in rxn.getGrad():
+
+                        # In case there is a gradient component defined but its key is
+                        # bound to a fixed parameter, rather than to a metabolite, we skip it.
+                        # One example is the transport and modification of a molecule
+                        # from the extracellular environment (e.g, PTS complex),
+                        # the extracellular could be considered constant, but not the
+                        # intracellular concentration of the molecule.
+                        if len(np.where(metIDList == gradDat[0])[0]) < 1 and not (gradDat[0] in depMetIDSet):
+                            continue
+
+                        if (verbose > 1):
+                            #print(gradDat,np.where(metIDList == gradDat[0]))
+                            print(gradDat)
+
+                        # For dependent reactions, we will write its gradient with respect to a free metabolite
+                        # and not with respect to the dependent metabolite it may be defined with.
+                        # The rate froms must reflect this definition and have, in its gradient components,
+                        # direct dependencies on the dependent metabolite derivatives.
+                        if gradDat[0] in depMetIDSet:
+                            targMet =  depMetMapping[gradDat[0]]
+                            freeTarget = False
                         else:
-                            if (verbose > 1):
-                                print("\tAutomatic Chain Rule for reaction",rxn.getID(), "target metabolite:",targMet)
-                            callJacDef += ident + cythVarPref + partName + " = (" + gradDat[1] + ")*d" + gradDat[0] + "_d" + targMet
-                        callJacDef += "\n\n"
-                        definedGrads.add(partName)
-                    
-                    if jacResIJ[iIndx][jIndx] == "0":
-                       jacResIJ[iIndx][jIndx] = stoiStr + "*" + partName
-                    else:
-                        jacResIJ[iIndx][jIndx] +=  " + " + stoiStr + "*" + partName
-                    
-                if (verbose > 1):
-                    print("---")
-                
-        convFact = self.model.getUnitConvFactor()
-        modelGR = self.model.getGR()
-        
-        for i in range(numMets):
-            for j in range(numMets):
-                
-                if jacResIJ[i][j] != "0":
-                    
-                    # Adds term for unit conversion
-                    if (convFact != 1):
-                        jacResIJ[i][j] = "(" + jacResIJ[i][j] + ")*" + str(convFact)
-                    
-                    # Adds the term for dillution
-                    if (i == j) and (modelGR != 0):
+                            targMet = gradDat[0]
+                            freeTarget = True
+
+                        jIndx = np.where(metIDList == targMet)[0][0]
+
+                        partName = "dV" + str(rxn.getNumber()) + "_d" + targMet
+
+                        if not partName in definedGrads:
+                            callJacDef += ident + "# (" + rxn.getID() + ") [" + gradDat[0] + "] " + rxn.getName() + "\n"
+                            if freeTarget:
+                                callJacDef += ident + cythVarPref + partName + " = " + gradDat[1]
+                            else:
+                                if (verbose > 1):
+                                    print("\tAutomatic Chain Rule for reaction",rxn.getID(), "target metabolite:",targMet)
+                                callJacDef += ident + cythVarPref + partName + " = (" + gradDat[1] + ")*d" + gradDat[0] + "_d" + targMet
+                            callJacDef += "\n\n"
+                            definedGrads.add(partName)
+
+                        if jacResIJ[iIndx][jIndx] == "0":
+                           jacResIJ[iIndx][jIndx] = stoiStr + "*" + partName
+                        else:
+                            jacResIJ[iIndx][jIndx] +=  " + " + stoiStr + "*" + partName
+
+                    if (verbose > 1):
+                        print("---")
+
+            convFact = self.model.getUnitConvFactor()
+            modelGR = self.model.getGR()
+
+            for i in range(numMets):
+                for j in range(numMets):
+
+                    if jacResIJ[i][j] != "0":
+
+                        # Adds term for unit conversion
+                        if (convFact != 1):
+                            jacResIJ[i][j] = "(" + jacResIJ[i][j] + ")*" + str(convFact)
+
+                        # Adds the term for dillution
+                        if (i == j) and (modelGR != 0):
+                            if not self.model.getMetList(i).getMode() == "odeonly":
+                                jacResIJ[i][j] += " - " + str(modelGR)
+
+                    elif (i == j) and (modelGR != 0):
                         if not self.model.getMetList(i).getMode() == "odeonly":
-                            jacResIJ[i][j] += " - " + str(modelGR)
-                    
-                elif (i == j) and (modelGR != 0):
-                    if not self.model.getMetList(i).getMode() == "odeonly":
-                        jacResIJ[i][j] = " - " + str(modelGR)
-            
-        ## Creates the return line for the calcJac function.
-        returnJacList = []
-        
-        for i in range(numMets):
-            
-            line = jacResIJ[i][0]
-            
-            for j in range(1, numMets):
-                
-                line += "," + jacResIJ[i][j]
-            
-            line = "[" + line + "]"
-            
-            returnJacList.append(line)
-        
-        
-        
-        # Assembles the return statement for the call function.
-        returnJacStr = "[" + ",\n ".join(returnJacList) + "]"
-        
-        callJacDef += "\n\n"
-        
-        #callJacDef += ident + "print(\"Calculating jacobian\")\n"
-        
-        # writes the return statement with the list of deltas.
-        if self.__transpJac:
-            callJacDef += ident + "return np.asmatrix(" + returnJacStr + ").T\n\n"
-        else:
-            callJacDef += ident + "return np.asmatrix(" + returnJacStr + ")\n\n"
-        
+                            jacResIJ[i][j] = " - " + str(modelGR)
+
+            ## Creates the return line for the calcJac function.
+            returnJacList = []
+
+            for i in range(numMets):
+
+                line = jacResIJ[i][0]
+
+                for j in range(1, numMets):
+
+                    line += "," + jacResIJ[i][j]
+
+                line = "[" + line + "]"
+
+                returnJacList.append(line)
+
+
+
+            # Assembles the return statement for the call function.
+            returnJacStr = "[" + ",\n ".join(returnJacList) + "]"
+
+            callJacDef += "\n\n"
+
+            #callJacDef += ident + "print(\"Calculating jacobian\")\n"
+
+            # writes the return statement with the list of deltas.
+            if self.__transpJac:
+                callJacDef += ident + "return np.asmatrix(" + returnJacStr + ").T\n\n"
+            else:
+                callJacDef += ident + "return np.asmatrix(" + returnJacStr + ")\n\n"
+
         ##########################
         
         
@@ -636,6 +659,14 @@ class ModelSolver():
         ## Implements new function into object
         
         if cythonBuild:
+
+            if sourceOnly:
+                # Additive code-generation interface: retain the normal return
+                # value, and do not write or load the legacy singleton module.
+                self.cythonSource = header + classDef + calcFluxDef + callDef
+                if useJac:
+                    self.cythonSource += callJacDef
+                return list(rxnRetunValID)
             
             with open("cythonCompiledFunctions.pyx", "w") as outfile:
                 outfile.write(header)
